@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { credentialStore } from "../credentials/credentialStore.js";
+import { credentialStore, type Credential } from "../credentials/credentialStore.js";
+import { metadataSearchIndex } from "../credentials/metadataSearchIndex.js";
 import {
   credentialImportStore,
   parseCredentialCsv,
@@ -71,6 +72,37 @@ export function handleApiV1Request(
         return;
       }
       await handleCredentialImport(req, res, authorized.payload.sub);
+      return;
+    }
+
+    // Issue #1775: full-text search over credential metadata, plus index stats and maintenance.
+    if (url.pathname === "/api/v1/credentials/metadata/search") {
+      if (req.method !== "GET") {
+        res.setHeader("allow", "GET");
+        sendJson(res, 405, { error: "method not allowed" });
+        return;
+      }
+      handleMetadataSearch(url, res);
+      return;
+    }
+
+    if (url.pathname === "/api/v1/credentials/metadata/index/stats") {
+      if (req.method !== "GET") {
+        res.setHeader("allow", "GET");
+        sendJson(res, 405, { error: "method not allowed" });
+        return;
+      }
+      sendJson(res, 200, metadataSearchIndex.stats());
+      return;
+    }
+
+    if (url.pathname === "/api/v1/credentials/metadata/index/maintenance") {
+      if (req.method !== "POST") {
+        res.setHeader("allow", "POST");
+        sendJson(res, 405, { error: "method not allowed" });
+        return;
+      }
+      sendJson(res, 200, metadataSearchIndex.runMaintenance());
       return;
     }
 
@@ -195,6 +227,40 @@ async function handleCredentialImport(
     console.error("[quorum-credit] unable to start credential import", error);
     sendJson(res, 503, { error: "credential import tracking capacity is unavailable" });
   }
+}
+
+const CREDENTIAL_STATUSES: ReadonlyArray<Credential["status"]> = ["active", "revoked", "expired", "suspended"];
+const CREDENTIAL_TYPES: ReadonlyArray<Credential["type"]> = ["identity", "education", "professional", "financial"];
+
+function parseOptionalInt(value: string | null): number | undefined {
+  if (value === null) return undefined;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function handleMetadataSearch(url: URL, res: ServerResponse): void {
+  const q = url.searchParams.get("q") ?? "";
+  const status = url.searchParams.get("status");
+  const type = url.searchParams.get("type");
+  if (status !== null && !CREDENTIAL_STATUSES.includes(status as Credential["status"])) {
+    sendJson(res, 400, { error: "status must be one of active, revoked, expired, suspended" });
+    return;
+  }
+  if (type !== null && !CREDENTIAL_TYPES.includes(type as Credential["type"])) {
+    sendJson(res, 400, { error: "type must be one of identity, education, professional, financial" });
+    return;
+  }
+  const result = metadataSearchIndex.search(q, {
+    status: (status ?? undefined) as Credential["status"] | undefined,
+    type: (type ?? undefined) as Credential["type"] | undefined,
+    limit: parseOptionalInt(url.searchParams.get("limit")),
+    offset: parseOptionalInt(url.searchParams.get("offset")),
+  });
+  if ("error" in result) {
+    sendJson(res, 400, { error: result.error });
+    return;
+  }
+  sendJson(res, 200, result);
 }
 
 function bearerToken(req: IncomingMessage): string | undefined {
