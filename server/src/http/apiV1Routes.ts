@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { credentialStore, type Credential } from "../credentials/credentialStore.js";
 import { metadataSearchIndex } from "../credentials/metadataSearchIndex.js";
+import { credentialRecommender } from "../recommendations/credentialRecommender.js";
 import {
   MAX_NOTE_LENGTH,
   attestationLedger,
@@ -111,6 +112,38 @@ export function handleApiV1Request(
         return;
       }
       sendJson(res, 200, metadataSearchIndex.runMaintenance());
+      return;
+    }
+
+    // Issue #1778: recommendations are always for the authenticated holder.
+    if (url.pathname === "/api/v1/credentials/recommendations") {
+      if (req.method !== "GET") {
+        res.setHeader("allow", "GET");
+        sendJson(res, 405, { error: "method not allowed" });
+        return;
+      }
+      const limit = parseOptionalInt(url.searchParams.get("limit"));
+      sendJson(res, 200, credentialRecommender.recommend(authorized.payload.sub, limit));
+      return;
+    }
+
+    if (url.pathname === "/api/v1/credentials/recommendations/feedback") {
+      if (req.method !== "POST") {
+        res.setHeader("allow", "POST");
+        sendJson(res, 405, { error: "method not allowed" });
+        return;
+      }
+      await handleRecommendationFeedback(req, res, authorized.payload.sub);
+      return;
+    }
+
+    if (url.pathname === "/api/v1/credentials/recommendations/effectiveness") {
+      if (req.method !== "GET") {
+        res.setHeader("allow", "GET");
+        sendJson(res, 405, { error: "method not allowed" });
+        return;
+      }
+      sendJson(res, 200, credentialRecommender.effectiveness());
       return;
     }
 
@@ -331,6 +364,29 @@ async function readJsonObject(
     });
     return undefined;
   }
+}
+
+async function handleRecommendationFeedback(
+  req: IncomingMessage,
+  res: ServerResponse,
+  holderId: string
+): Promise<void> {
+  const body = await readJsonObject(req, res);
+  if (!body) return;
+  if (typeof body.itemId !== "string" || body.itemId.length === 0) {
+    sendJson(res, 400, { error: "itemId is required" });
+    return;
+  }
+  if (body.outcome !== "accepted" && body.outcome !== "dismissed") {
+    sendJson(res, 400, { error: "outcome must be accepted or dismissed" });
+    return;
+  }
+  const result = credentialRecommender.recordFeedback(holderId, body.itemId, body.outcome);
+  if ("error" in result) {
+    sendJson(res, result.status, { error: result.error });
+    return;
+  }
+  sendJson(res, 201, result);
 }
 
 async function handleRecordAttestation(
